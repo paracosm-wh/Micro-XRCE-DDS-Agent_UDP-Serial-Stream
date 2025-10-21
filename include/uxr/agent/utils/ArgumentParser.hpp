@@ -71,6 +71,7 @@ enum class TransportKind
     SERIAL,
     MULTISERIAL,
     PSEUDOTERMINAL,
+    CUSTOM,
 #endif // _WIN32
     HELP
 };
@@ -975,6 +976,7 @@ public:
             case TransportKind::UDP6:
             case TransportKind::TCP4:
             case TransportKind::TCP6:
+            case TransportKind::CUSTOM:
             {
                 result &= ip_args_.parse(argc_, argv_);
                 break;
