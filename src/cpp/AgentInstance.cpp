@@ -14,6 +14,7 @@
 
 #include <uxr/agent/config.hpp>
 #include <uxr/agent/AgentInstance.hpp>
+#include <uxr/agent/transport/custom/CustomUdpServer.hpp>
 #include <uxr/agent/middleware/utils/Callbacks.hpp>
 
 namespace eprosima {
@@ -62,6 +63,11 @@ bool AgentInstance::create(
         case agent::TransportKind::TCP6:
         {
             agent_thread_ = std::move(agent::create_agent_thread<TCPv6Agent>(argc, argv, exit_signal, valid_transport));
+            break;
+        }
+        case agent::TransportKind::CUSTOM:
+        {
+            agent_thread_ = std::move(agent::create_agent_thread<CustomUdpServer>(argc, argv, exit_signal, valid_transport));
             break;
         }
 #ifndef _WIN32

@@ -40,6 +40,7 @@ option(UAGENT_SECURITY_PROFILE "Build security profile." OFF)
 option(UAGENT_BUILD_EXECUTABLE "Build Micro XRCE-DDS Agent provided executable." ON)
 option(UAGENT_BUILD_USAGE_EXAMPLES "Build Micro XRCE-DDS Agent built-in usage examples" OFF)
 
+
 set(UAGENT_P2P_CLIENT_VERSION 2.4.3 CACHE STRING "Sets Micro XRCE-DDS client version for P2P")
 set(UAGENT_P2P_CLIENT_TAG v2.4.3 CACHE STRING "Sets Micro XRCE-DDS client tag for P2P")
 
@@ -206,7 +207,7 @@ set(SRCS
     src/cpp/utils/ArgumentParser.cpp
     src/cpp/transport/Server.cpp
     src/cpp/transport/stream_framing/StreamFramingProtocol.cpp
-    src/cpp/transport/custom/CustomAgent.cpp
+    src/cpp/transport/custom/CustomUdpServer.cpp
     ${TRANSPORT_SRCS}
     $<$<BOOL:${UAGENT_DISCOVERY_PROFILE}>:src/cpp/transport/discovery/DiscoveryServer.cpp>
     $<$<BOOL:${UAGENT_FAST_PROFILE}>:src/cpp/types/TopicPubSubType.cpp>
@@ -340,7 +341,7 @@ endif()
 
 # Examples
 if(UAGENT_BUILD_USAGE_EXAMPLES)
-    add_subdirectory(examples/custom_agent)
+    # add_subdirectory(examples/custom_agent)
 endif()
 
 # XML default profile used to launch exec in the building folder

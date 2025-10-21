@@ -31,7 +31,7 @@ bool eprosima::uxr::agent::parser::utils::usage(
         executable_name_str = executable_name_str.substr(pos + 1);
     }
     std::stringstream ss;
-    ss << "Usage: '" << executable_name_str << " <udp4|udp6|tcp4|tpc6";
+    ss << "Usage: '" << executable_name_str << " <udp4|udp6|tcp4|tpc6|custom_udp";
 #ifndef _WIN32
     ss << "|canfd|serial|multiserial|pseudoterminal";
 #endif // _WIN32
@@ -53,6 +53,7 @@ eprosima::uxr::agent::TransportKind eprosima::uxr::agent::parser::utils::check_t
     {"udp6", eprosima::uxr::agent::TransportKind::UDP6},
     {"tcp4", eprosima::uxr::agent::TransportKind::TCP4},
     {"tcp6", eprosima::uxr::agent::TransportKind::TCP6},
+    {"custom_udp", eprosima::uxr::agent::TransportKind::CUSTOM},
 #ifndef _WIN32
 #ifdef UAGENT_SOCKETCAN_PROFILE
     {"canfd", eprosima::uxr::agent::TransportKind::CAN},
