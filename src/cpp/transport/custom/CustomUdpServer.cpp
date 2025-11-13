@@ -86,7 +86,7 @@ bool CustomUdpServer::process_client_buffer(
 
     uint8_t remote_addr;
     std::array<uint8_t, SERVER_BUFFER_SIZE> message_buffer;
-    int framing_timeout = 0;
+    int framing_timeout = 1;
     ssize_t bytes_read = framing_io.read_framed_msg(
         message_buffer.data(), message_buffer.size(), remote_addr, framing_timeout, transport_rc);
 
@@ -139,7 +139,10 @@ bool CustomUdpServer::recv_message(
         }
 
         auto time_left = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - std::chrono::steady_clock::now()).count();
-        if (time_left <= 0) break;
+        if (time_left <= 0)
+        {
+            break;
+        }
 
         pollfd pfd{socket_.native_handle(), POLLIN, 0};
         int poll_rv = poll(&pfd, 1, static_cast<int>(time_left));
@@ -182,6 +185,12 @@ bool CustomUdpServer::recv_message(
                         "what: {}", e.what());
                 }
             }
+        }
+        else if (poll_rv < 0)
+        {
+            // Error
+            transport_rc = TransportRc::server_error;
+            return false;
         }
     } while (std::chrono::steady_clock::now() < end_time);
 
