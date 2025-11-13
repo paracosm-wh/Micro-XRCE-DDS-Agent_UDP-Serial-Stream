@@ -113,6 +113,13 @@ bool CustomUdpServer::process_client_buffer(
             input_packet.message->get_len());
         return true;
     }
+    else if (!client_io.recv_buffer.empty())
+    {
+        UXR_AGENT_LOG_INFO(
+            UXR_DECORATE_YELLOW("CustomUDP could not deframe message"),
+            "buffer size: {}",
+            client_io.recv_buffer.size());
+    }
     return false;
 }
 
@@ -121,6 +128,10 @@ bool CustomUdpServer::recv_message(
         int timeout,
         TransportRc& transport_rc)
 {
+    UXR_AGENT_LOG_INFO(
+        UXR_DECORATE_YELLOW("CustomUDP recv_message called"),
+        "timeout: {}",
+        timeout);
 
     auto end_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
 
@@ -194,6 +205,10 @@ bool CustomUdpServer::recv_message(
         }
     } while (std::chrono::steady_clock::now() < end_time);
 
+    UXR_AGENT_LOG_INFO(
+        UXR_DECORATE_YELLOW("CustomUDP recv_message timeout"),
+        "timeout: {}",
+        timeout);
     transport_rc = TransportRc::timeout_error;
     return false;
 }
