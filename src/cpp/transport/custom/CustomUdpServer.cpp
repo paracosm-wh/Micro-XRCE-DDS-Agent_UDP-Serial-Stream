@@ -111,27 +111,7 @@ bool CustomUdpServer::process_client_buffer(
             client_key,
             input_packet.message->get_buf(),
             input_packet.message->get_len());
-        UXR_AGENT_LOG_INFO(
-            UXR_DECORATE_GREEN("CustomUDP message parsed successfully!"),
-            "client_key: {}",
-            client_key);
         return true;
-    }
-    else if (!client_io.recv_buffer.empty())
-    {
-        std::string buf_hex;
-        for(uint8_t byte : client_io.recv_buffer)
-        {
-            char hex[4];
-            sprintf(hex, "%02X ", byte);
-            buf_hex += hex;
-        }
-
-        UXR_AGENT_LOG_INFO(
-            UXR_DECORATE_YELLOW("CustomUDP could not deframe message"),
-            "buffer size: {}, content: {}",
-            client_io.recv_buffer.size(),
-            buf_hex);
     }
     return false;
 }
@@ -141,11 +121,6 @@ bool CustomUdpServer::recv_message(
         int timeout,
         TransportRc& transport_rc)
 {
-    UXR_AGENT_LOG_INFO(
-        UXR_DECORATE_YELLOW("CustomUDP recv_message called"),
-        "timeout: {}",
-        timeout);
-
     auto end_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
 
     do
