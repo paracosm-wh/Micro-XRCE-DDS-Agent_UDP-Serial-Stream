@@ -111,6 +111,10 @@ bool CustomUdpServer::process_client_buffer(
             client_key,
             input_packet.message->get_buf(),
             input_packet.message->get_len());
+        UXR_AGENT_LOG_INFO(
+            UXR_DECORATE_GREEN("CustomUDP message parsed successfully!"),
+            "client_key: {}",
+            client_key);
         return true;
     }
     else if (!client_io.recv_buffer.empty())
