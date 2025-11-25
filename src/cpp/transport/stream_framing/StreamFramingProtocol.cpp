@@ -86,7 +86,7 @@ size_t FramingIO::write_framed_msg(
         octet = *(tmp_crc + written_len);
         if (add_next_octet(octet))
         {
-            // update_crc(crc, octet);
+            update_crc(crc, octet);
             ++written_len;
         }
         else
