@@ -118,33 +118,28 @@ bool CustomUdpServer::process_client_buffer(
 
 bool CustomUdpServer::recv_message(
         InputPacket<CustomEndPoint>& input_packet,
-        int timeout,
+        int /*timeout*/,
         TransportRc& transport_rc)
 {
-    auto end_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
-
-    do
+    // This function will now wait indefinitely for a message.
+    while (true)
     {
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (auto& it : client_io_map_)
             {
-                if (it.second->recv_buffer.empty()) continue;
-                if (process_client_buffer(*it.second, it.first, input_packet, transport_rc))
+                if (it->second->recv_buffer.empty()) continue;
+                if (process_client_buffer(*it->second, it->first, input_packet, transport_rc))
                 {
-                    return true;
+                    return true; // Success, a message was processed.
                 }
             }
         }
 
-        auto time_left = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - std::chrono::steady_clock::now()).count();
-        if (time_left <= 0)
-        {
-            break;
-        }
-
+        // Poll for new data with a fixed, reasonable timeout (e.g., 1000ms).
+        // This prevents a busy-wait loop while still being responsive.
         pollfd pfd{socket_.native_handle(), POLLIN, 0};
-        int poll_rv = poll(&pfd, 1, static_cast<int>(time_left));
+        int poll_rv = poll(&pfd, 1, 1000); // Poll for 1 second
 
         if (poll_rv > 0)
         {
@@ -154,7 +149,7 @@ bool CustomUdpServer::recv_message(
                     UXR_DECORATE_RED("UDP Socket Error"),
                     "poll() returned error event: {}", pfd.revents);
                 transport_rc = TransportRc::server_error;
-                return false;
+                return false; // Hard error, return immediately.
             }
 
             if (pfd.revents & POLLIN)
@@ -187,17 +182,14 @@ bool CustomUdpServer::recv_message(
         }
         else if (poll_rv < 0)
         {
-            // Error
+            // Error from poll()
             transport_rc = TransportRc::server_error;
-            return false;
+            return false; // Hard error, return immediately.
         }
-    } while (std::chrono::steady_clock::now() < end_time);
-
-    UXR_AGENT_LOG_INFO(
-        UXR_DECORATE_YELLOW("CustomUDP recv_message timeout"),
-        "timeout: {}",
-        timeout);
-    transport_rc = TransportRc::timeout_error;
+        // If poll_rv == 0 (timeout), the loop will just continue, and we will poll again.
+        // This achieves the "wait forever" behavior without a fatal timeout.
+    }
+    // The function should never reach here.
     return false;
 }
 
