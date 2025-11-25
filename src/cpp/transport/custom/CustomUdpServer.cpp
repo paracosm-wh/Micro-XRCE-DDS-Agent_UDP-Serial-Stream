@@ -128,8 +128,8 @@ bool CustomUdpServer::recv_message(
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (auto& it : client_io_map_)
             {
-                if (it->second->recv_buffer.empty()) continue;
-                if (process_client_buffer(*it->second, it->first, input_packet, transport_rc))
+                if (it.second->recv_buffer.empty()) continue;
+                if (process_client_buffer(*it.second, it.first, input_packet, transport_rc))
                 {
                     return true; // Success, a message was processed.
                 }
