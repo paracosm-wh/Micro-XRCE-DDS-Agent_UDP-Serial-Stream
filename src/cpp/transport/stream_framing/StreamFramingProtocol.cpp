@@ -129,38 +129,34 @@ size_t FramingIO::read_framed_msg(
             uint8_t octet = 0;
             switch (state_)
             {
-                case InputState::UXR_FRAMING_UNINITIALIZED:
+            case InputState::UXR_FRAMING_UNINITIALIZED:
+            {
+                bool found_flag = false;
+                while (!found_flag)
                 {
-                    octet = 0;
-                    while ((framing_begin_flag != octet) &&
-                           (read_buffer_head_ != read_buffer_tail_))
+                    uint8_t octet = 0;
+                    while ((framing_begin_flag != octet) && (read_buffer_head_ != read_buffer_tail_))
                     {
                         octet = read_buffer_[read_buffer_tail_];
-                        read_buffer_tail_ =
-                            static_cast<uint8_t>(
-                                static_cast<size_t>(
-                                    read_buffer_tail_ + 1) %
-                                    sizeof(read_buffer_));
+                        read_buffer_tail_ = static_cast<uint8_t>(static_cast<size_t>(read_buffer_tail_ + 1) % sizeof(read_buffer_));
                     }
 
                     if (framing_begin_flag == octet)
                     {
                         state_ = InputState::UXR_FRAMING_READING_SRC_ADDR;
+                        found_flag = true;
                     }
                     else
                     {
-                        // If no framing_begin_flag found, try to read more data
-                        if (0 < transport_read(timeout, transport_rc, 1))
+                        if (0 >= transport_read(timeout, transport_rc, sizeof(read_buffer_))) 
                         {
-                            // Successfully read more data, continue loop
-                        }
-                        else
-                        {
-                            exit_cond = true; // Really no more data, so exit
+                            exit_cond = true;
+                            break;
                         }
                     }
-                    break;
                 }
+                break;
+            }
                 case InputState::UXR_FRAMING_READING_SRC_ADDR:
                 {
                     if (get_next_octet(remote_addr_))
