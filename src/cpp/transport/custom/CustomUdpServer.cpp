@@ -72,6 +72,11 @@ bool CustomUdpServer::process_client_buffer(
     InputPacket<CustomEndPoint>& input_packet,
     TransportRc& transport_rc)
 {
+    UXR_AGENT_LOG_DEBUG(
+        UXR_DECORATE_WHITE("Processing buffer"),
+        "Buffer size before parse: {}",
+        client_io.recv_buffer.size());
+
     client_io.read_pos = 0;
     auto read_lam = [&](uint8_t* buf, size_t len, int, TransportRc&) -> ssize_t
     {
@@ -90,10 +95,22 @@ bool CustomUdpServer::process_client_buffer(
     ssize_t bytes_read = framing_io.read_framed_msg(
         message_buffer.data(), message_buffer.size(), remote_addr, framing_timeout, transport_rc);
 
+    UXR_AGENT_LOG_DEBUG(
+        UXR_DECORATE_WHITE("Parse attempt complete"),
+        "Parsed message length: {}, Raw bytes consumed: {}",
+        bytes_read,
+        client_io.read_pos);
+
     if (bytes_read > 0)
     {
         input_packet.message.reset(new InputMessage(message_buffer.data(), static_cast<size_t>(bytes_read)));
+        
         client_io.recv_buffer.erase(client_io.recv_buffer.begin(), client_io.recv_buffer.begin() + client_io.read_pos);
+        
+        UXR_AGENT_LOG_DEBUG(
+            UXR_DECORATE_WHITE("Buffer after erase"),
+            "New buffer size: {}",
+            client_io.recv_buffer.size());
 
         CustomEndPoint custom_endpoint;
         custom_endpoint.add_member<std::string>("address");
@@ -116,22 +133,6 @@ bool CustomUdpServer::process_client_buffer(
             "client_key: {}",
             client_key);
         return true;
-    }
-    else if (!client_io.recv_buffer.empty())
-    {
-        std::string buf_hex;
-        for(uint8_t byte : client_io.recv_buffer)
-        {
-            char hex[4];
-            sprintf(hex, "%02X ", byte);
-            buf_hex += hex;
-        }
-
-        UXR_AGENT_LOG_INFO(
-            UXR_DECORATE_YELLOW("CustomUDP could not deframe message"),
-            "buffer size: {}, content: {}",
-            client_io.recv_buffer.size(),
-            buf_hex);
     }
     return false;
 }
