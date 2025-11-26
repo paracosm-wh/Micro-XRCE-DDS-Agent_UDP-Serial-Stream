@@ -314,12 +314,12 @@ size_t FramingIO::read_framed_msg(
                     {
                         msg_crc_ += (octet << 8);
                         state_ = InputState::UXR_FRAMING_UNINITIALIZED;
-                                                                                    if (true) /* CRC CHECK BYPASSED FOR DEBUGGING */
-                                                                                    {
-                                                                                        remote_addr = remote_addr_;
-                                                                                        rv = msg_len_;
-                                                                                    }
-                                                                                    exit_cond = true;                    }
+                                                                                                        if (cmp_crc_ == msg_crc_)
+                                                                                                        {
+                                                                                                            remote_addr = remote_addr_;
+                                                                                                            rv = msg_len_;
+                                                                                                        }
+                                                                                                        exit_cond = true;                    }
                     else if(0 < transport_read(timeout, transport_rc, 1))
                     {
 

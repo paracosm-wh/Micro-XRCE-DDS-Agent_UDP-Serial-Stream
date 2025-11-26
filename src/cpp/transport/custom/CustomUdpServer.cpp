@@ -117,6 +117,22 @@ bool CustomUdpServer::process_client_buffer(
             client_key);
         return true;
     }
+    else if (!client_io.recv_buffer.empty())
+    {
+        std::string buf_hex;
+        for(uint8_t byte : client_io.recv_buffer)
+        {
+            char hex[4];
+            sprintf(hex, "%02X ", byte);
+            buf_hex += hex;
+        }
+
+        UXR_AGENT_LOG_INFO(
+            UXR_DECORATE_YELLOW("CustomUDP could not deframe message"),
+            "buffer size: {}, content: {}",
+            client_io.recv_buffer.size(),
+            buf_hex);
+    }
     return false;
 }
 
