@@ -149,7 +149,15 @@ size_t FramingIO::read_framed_msg(
                     }
                     else
                     {
-                        exit_cond = true;
+                        // If no framing_begin_flag found, try to read more data
+                        if (0 < transport_read(timeout, transport_rc, 1))
+                        {
+                            // Successfully read more data, continue loop
+                        }
+                        else
+                        {
+                            exit_cond = true; // Really no more data, so exit
+                        }
                     }
                     break;
                 }
