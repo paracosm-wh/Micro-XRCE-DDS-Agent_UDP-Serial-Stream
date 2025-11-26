@@ -245,6 +245,10 @@ template<typename EndPoint>
 bool Processor<EndPoint>::process_create_client_submessage(
         InputPacket<EndPoint>& input_packet)
 {
+    UXR_AGENT_LOG_DEBUG(
+        UXR_DECORATE_WHITE("Processor"),
+        "Entering process_create_client_submessage.{}", "");
+
     bool rv = true;
     dds::xrce::CREATE_CLIENT_Payload client_payload;
     if (((input_packet.message->get_header().session_id() == dds::xrce::SESSIONID_NONE_WITH_CLIENT_KEY) ||
@@ -262,6 +266,10 @@ bool Processor<EndPoint>::process_create_client_submessage(
                 (dds::xrce::STATUS_ERR_UNKNOWN_REFERENCE == delete_status))
             {
                 server_.destroy_session(input_packet.source);
+                UXR_AGENT_LOG_DEBUG(
+                    UXR_DECORATE_WHITE("Processor"),
+                    "Destroyed existing session for client_key: 0x{:08X}",
+                    raw_client_key);
             }
             else
             {
@@ -280,11 +288,20 @@ bool Processor<EndPoint>::process_create_client_submessage(
                         agent_representation,
                         middleware_kind_);
 
+            UXR_AGENT_LOG_DEBUG(
+                UXR_DECORATE_WHITE("Processor"),
+                "root_.create_client result status: {}",
+                result.status());
+
             if (dds::xrce::STATUS_OK == result.status())
             {
                 server_.establish_session(input_packet.source,
                                           conversion::clientkey_to_raw(client_payload.client_representation().client_key()),
                                           client_payload.client_representation().session_id());
+                UXR_AGENT_LOG_DEBUG(
+                    UXR_DECORATE_WHITE("Processor"),
+                    "Session established for client_key: 0x{:08X}",
+                    conversion::clientkey_to_raw(client_payload.client_representation().client_key()));
             }
 
             dds::xrce::STATUS_AGENT_Payload status_agent;
@@ -306,11 +323,18 @@ bool Processor<EndPoint>::process_create_client_submessage(
             output_packet.message->append_submessage(dds::xrce::STATUS_AGENT, status_agent);
 
             server_.push_output_packet(std::move(output_packet));
+            UXR_AGENT_LOG_DEBUG(
+                UXR_DECORATE_WHITE("Processor"),
+                "STATUS_AGENT reply pushed for client_key: 0x{:08X}",
+                conversion::clientkey_to_raw(client_payload.client_representation().client_key()));
         }
     }
     else
     {
         rv = false;
+        UXR_AGENT_LOG_DEBUG(
+            UXR_DECORATE_WHITE("Processor"),
+            "Failed to get CREATE_CLIENT payload or invalid session_id.{}", "");
     }
 
     return rv;
