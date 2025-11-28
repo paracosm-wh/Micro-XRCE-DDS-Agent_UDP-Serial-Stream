@@ -5,9 +5,35 @@
 #include <asio.hpp>
 #include <poll.h>
 #include <unistd.h>
+#include <algorithm>
+#include <vector>
+#include <array>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
 
 namespace eprosima {
 namespace uxr {
+
+// --- 配置常量，可按需调整 --------------------------------
+static constexpr uint8_t HDLC_FLAG = 0x7E; // 帧头标志（若不是 0x7E，请调整）
+static constexpr size_t MAX_CLIENT_BUFFER_SIZE = 16 * 1024; // 单客户端缓冲上限
+static constexpr size_t KEEP_TAIL_ON_RESYNC = 32; // 找不到 FLAG 时保留尾部字节数（用于半帧拼接）
+// ---------------------------------------------------------
+
+// 内部 pending 队列，用于存放 parse 出来的但尚未被上层消费的帧
+namespace {
+struct PendingFrame
+{
+    std::unique_ptr<InputMessage> msg;
+    std::string address;
+    uint16_t port;
+    uint8_t framing_addr;
+};
+static std::deque<PendingFrame> pending_frames_;
+static std::mutex pending_frames_mutex_;
+} // anonymous
 
 CustomUdpServer::CustomUdpServer(
         uint16_t port,
@@ -66,6 +92,15 @@ bool CustomUdpServer::fini()
     return true;
 }
 
+/**
+ * process_client_buffer
+ *
+ * - 支持一次解析出多个连续完整帧；
+ * - 将第一个帧放入 input_packet 返回；
+ * - 将解析出的后续帧存入内部 pending_frames_，由 recv_message 优先返回；
+ * - 若解析失败但读过部分字节（read_pos > 0），会保留这些尾部字节（用于下次拼接）；
+ * - 若 buffer 无 FLAG，则保留尾部 KEEP_TAIL_ON_RESYNC 字节以便拼接；
+ */
 bool CustomUdpServer::process_client_buffer(
     ClientIO& client_io,
     const asio::ip::udp::endpoint& endpoint,
@@ -77,40 +112,145 @@ bool CustomUdpServer::process_client_buffer(
         "Buffer size before parse: {}",
         client_io.recv_buffer.size());
 
-    client_io.read_pos = 0;
-    auto read_lam = [&](uint8_t* buf, size_t len, int, TransportRc&) -> ssize_t
+    // 限制单客户端 buffer 大小，防止无限增长
+    if (client_io.recv_buffer.size() > MAX_CLIENT_BUFFER_SIZE)
     {
-        if (client_io.read_pos >= client_io.recv_buffer.size()) { return 0; }
-        size_t bytes_to_copy = std::min(len, client_io.recv_buffer.size() - client_io.read_pos);
-        std::memcpy(buf, client_io.recv_buffer.data() + client_io.read_pos, bytes_to_copy);
-        client_io.read_pos += bytes_to_copy;
-        return static_cast<ssize_t>(bytes_to_copy);
-    };
-
-    FramingIO framing_io(0x00, [](uint8_t*, size_t, TransportRc&){ return 0; }, read_lam);
-
-    uint8_t remote_addr;
-    std::array<uint8_t, SERVER_BUFFER_SIZE> message_buffer;
-    int framing_timeout = 1;
-    ssize_t bytes_read = framing_io.read_framed_msg(
-        message_buffer.data(), message_buffer.size(), remote_addr, framing_timeout, transport_rc);
-
-    UXR_AGENT_LOG_DEBUG(
-        UXR_DECORATE_WHITE("Parse attempt complete"),
-        "Parsed message length: {}, Raw bytes consumed: {}",
-        bytes_read,
-        client_io.read_pos);
-
-    if (bytes_read > 0)
-    {
-        input_packet.message.reset(new InputMessage(message_buffer.data(), static_cast<size_t>(bytes_read)));
-        
-        client_io.recv_buffer.erase(client_io.recv_buffer.begin(), client_io.recv_buffer.begin() + client_io.read_pos);
-        
-        UXR_AGENT_LOG_DEBUG(
-            UXR_DECORATE_WHITE("Buffer after erase"),
-            "New buffer size: {}",
+        // 保留最新的数据
+        size_t drop = client_io.recv_buffer.size() - MAX_CLIENT_BUFFER_SIZE;
+        client_io.recv_buffer.erase(client_io.recv_buffer.begin(), client_io.recv_buffer.begin() + drop);
+        UXR_AGENT_LOG_WARN(
+            UXR_DECORATE_YELLOW("Client buffer truncated to max size"),
+            "Dropped {} bytes, new size {}",
+            drop,
             client_io.recv_buffer.size());
+    }
+
+    // 如果 buffer 为空，直接返回
+    if (client_io.recv_buffer.empty())
+    {
+        return false;
+    }
+
+    std::vector<std::unique_ptr<InputMessage>> parsed_messages;
+    std::vector<uint8_t> parsed_framing_addrs; // 与 parsed_messages 对应的 framing addr
+
+    // 反复尝试解析 buffer，直到没有完整帧为止
+    while (true)
+    {
+        client_io.read_pos = 0;
+        auto read_lam = [&](uint8_t* buf, size_t len, int, TransportRc&) -> ssize_t
+        {
+            if (client_io.read_pos >= client_io.recv_buffer.size()) { return 0; }
+            size_t bytes_to_copy = std::min(len, client_io.recv_buffer.size() - client_io.read_pos);
+            std::memcpy(buf, client_io.recv_buffer.data() + client_io.read_pos, bytes_to_copy);
+            client_io.read_pos += bytes_to_copy;
+            return static_cast<ssize_t>(bytes_to_copy);
+        };
+
+        FramingIO framing_io(0x00, [](uint8_t*, size_t, TransportRc&){ return 0; }, read_lam);
+
+        uint8_t remote_addr = 0;
+        std::array<uint8_t, SERVER_BUFFER_SIZE> message_buffer;
+        int framing_timeout = 1;
+        ssize_t bytes_read = framing_io.read_framed_msg(
+            message_buffer.data(), message_buffer.size(), remote_addr, framing_timeout, transport_rc);
+
+        UXR_AGENT_LOG_DEBUG(
+            UXR_DECORATE_WHITE("Parse attempt complete (multi-loop)"),
+            "Parsed message length: {}, Raw bytes consumed: {}",
+            bytes_read,
+            client_io.read_pos);
+
+        if (bytes_read > 0)
+        {
+            // 成功解析出一帧：拷贝消息并记录 framing addr
+            auto imsg = std::unique_ptr<InputMessage>(new InputMessage(message_buffer.data(), static_cast<size_t>(bytes_read)));
+            parsed_messages.push_back(std::move(imsg));
+            parsed_framing_addrs.push_back(remote_addr);
+
+            // 从 recv_buffer 中删除已消费的字节（read_pos）
+            client_io.recv_buffer.erase(client_io.recv_buffer.begin(), client_io.recv_buffer.begin() + client_io.read_pos);
+
+            // 继续循环尝试解析 buffer 中的下一个完整帧（如果存在）
+            if (client_io.recv_buffer.empty())
+            {
+                break;
+            }
+            else
+            {
+                // 有剩余数据，继续下一轮解析
+                continue;
+            }
+        }
+        else
+        {
+            // 未解析到完整帧
+            if (client_io.read_pos > 0)
+            {
+                // read_pos > 0：说明已经读过一部分（半帧），但无法解析完整帧
+                // 保留这部分数据（作为半帧），等待下次拼接
+                // 我们不删除这段尾部，以便下次追加与解析
+                UXR_AGENT_LOG_DEBUG(
+                    UXR_DECORATE_WHITE("Partial consumption, preserving tail for next read"),
+                    "Preserving {} bytes tail for client", client_io.recv_buffer.size());
+                // 在前面循环中 read_pos 只用作读取位置，我们已经没有删除任何数据（因为在失败分支没有 erase）
+                // 直接退出解析循环
+                break;
+            }
+            else
+            {
+                // read_pos == 0：表示解析器一开始就无法识别当前 buffer（可能因为前导垃圾导致未对齐）
+                // 尝试寻找第一个 HDLC_FLAG 进行 resync
+                auto it = std::find(client_io.recv_buffer.begin(), client_io.recv_buffer.end(), HDLC_FLAG);
+                if (it != client_io.recv_buffer.end())
+                {
+                    // 找到了帧头，将帧头之前的垃圾数据丢弃，但保留从帧头开始的半帧
+                    if (it != client_io.recv_buffer.begin())
+                    {
+                        size_t dropped = static_cast<size_t>(std::distance(client_io.recv_buffer.begin(), it));
+                        client_io.recv_buffer.erase(client_io.recv_buffer.begin(), it);
+                        UXR_AGENT_LOG_WARN(
+                            UXR_DECORATE_YELLOW("Resync: discarded leading garbage"),
+                            "Dropped {} bytes before HDLC flag, new buffer size {}",
+                            dropped,
+                            client_io.recv_buffer.size());
+                    }
+                    // 等待更多数据到来以完成帧
+                    break;
+                }
+                else
+                {
+                    // 整体 buffer 中没有找到 HDLC_FLAG：保守策略，保留尾部 KEEP_TAIL_ON_RESYNC 字节
+                    if (client_io.recv_buffer.size() > KEEP_TAIL_ON_RESYNC)
+                    {
+                        size_t keep = KEEP_TAIL_ON_RESYNC;
+                        size_t drop = client_io.recv_buffer.size() - keep;
+                        client_io.recv_buffer.erase(client_io.recv_buffer.begin(), client_io.recv_buffer.begin() + drop);
+                        UXR_AGENT_LOG_WARN(
+                            UXR_DECORATE_YELLOW("No HDLC flag found"),
+                            "Buffer contained no HDLC flag, truncating to last {} bytes (dropped {})",
+                            keep, drop);
+                    }
+                    else
+                    {
+                        // buffer 很短且无 flag，直接保留，等待更多数据
+                    }
+                    break;
+                }
+            }
+        }
+    } // end while parse-loop
+
+    // 如果没有解析到任何完整帧，则返回 false
+    if (parsed_messages.empty())
+    {
+        return false;
+    }
+
+    // parsed_messages 至少有一帧：把第一帧放到 input_packet 返回
+    {
+        auto &first_msg = parsed_messages.front();
+        input_packet.message.reset(new InputMessage(first_msg->get_buf(), first_msg->get_len()));
 
         CustomEndPoint custom_endpoint;
         custom_endpoint.add_member<std::string>("address");
@@ -118,9 +258,10 @@ bool CustomUdpServer::process_client_buffer(
         custom_endpoint.add_member<uint8_t>("framing_addr");
         custom_endpoint.set_member_value("address", endpoint.address().to_string());
         custom_endpoint.set_member_value("port", endpoint.port());
-        custom_endpoint.set_member_value("framing_addr", uint8_t(remote_addr));
+        custom_endpoint.set_member_value("framing_addr", uint8_t(parsed_framing_addrs.front()));
         input_packet.source = custom_endpoint;
 
+        // 日志与上报
         uint32_t client_key = 0;
         get_client_key(input_packet.source, client_key);
         UXR_AGENT_LOG_MESSAGE(
@@ -132,9 +273,28 @@ bool CustomUdpServer::process_client_buffer(
             UXR_DECORATE_GREEN("CustomUDP message parsed successfully!"),
             "client_key: {}",
             client_key);
-        return true;
     }
-    return false;
+
+    // 若 parsed_messages.size() > 1，将后续消息存入 pending_frames_ 以便下次 recv_message 调用先返回它们
+    if (parsed_messages.size() > 1)
+    {
+        std::lock_guard<std::mutex> lock(pending_frames_mutex_);
+        for (size_t i = 1; i < parsed_messages.size(); ++i)
+        {
+            PendingFrame pf;
+            pf.msg = std::move(parsed_messages[i]);
+            pf.address = endpoint.address().to_string();
+            pf.port = endpoint.port();
+            pf.framing_addr = parsed_framing_addrs[i];
+            pending_frames_.push_back(std::move(pf));
+        }
+        UXR_AGENT_LOG_DEBUG(
+            UXR_DECORATE_WHITE("Multiple frames parsed"),
+            "Parsed {} frames (1 delivered, {} queued)", parsed_messages.size(), parsed_messages.size() - 1);
+    }
+
+    // 返回 true 表示已产生一个可交付的 input_packet
+    return true;
 }
 
 bool CustomUdpServer::recv_message(
@@ -142,6 +302,37 @@ bool CustomUdpServer::recv_message(
         int /*timeout*/,
         TransportRc& transport_rc)
 {
+    // 优先检查内部 pending_frames_ 队列（这是本次增强的关键点）
+    {
+        std::lock_guard<std::mutex> lock(pending_frames_mutex_);
+        if (!pending_frames_.empty())
+        {
+            PendingFrame pf = std::move(pending_frames_.front());
+            pending_frames_.pop_front();
+
+            input_packet.message.reset(new InputMessage(pf.msg->get_buf(), pf.msg->get_len()));
+
+            CustomEndPoint custom_endpoint;
+            custom_endpoint.add_member<std::string>("address");
+            custom_endpoint.add_member<uint16_t>("port");
+            custom_endpoint.add_member<uint8_t>("framing_addr");
+            custom_endpoint.set_member_value("address", pf.address);
+            custom_endpoint.set_member_value("port", pf.port);
+            custom_endpoint.set_member_value("framing_addr", pf.framing_addr);
+            input_packet.source = custom_endpoint;
+
+            uint32_t client_key = 0;
+            get_client_key(input_packet.source, client_key);
+            UXR_AGENT_LOG_MESSAGE(
+                UXR_DECORATE_YELLOW("[==>> CustomUDP (hdlc) (pending) <<==]"),
+                client_key,
+                input_packet.message->get_buf(),
+                input_packet.message->get_len());
+            transport_rc = TransportRc::ok;
+            return true;
+        }
+    }
+
     // This function will now wait indefinitely for a message.
     while (true)
     {
@@ -158,7 +349,7 @@ bool CustomUdpServer::recv_message(
         }
 
         // Poll for new data with a fixed, reasonable timeout (e.g., 1000ms).
-        // This prevents a busy-wait loop while still being responsive.
+        // This prevents busy-waiting while still being responsive.
         pollfd pfd{socket_.native_handle(), POLLIN, 0};
         int poll_rv = poll(&pfd, 1, 1000); // Poll for 1 second
 
@@ -190,7 +381,23 @@ bool CustomUdpServer::recv_message(
                         {
                             it = client_io_map_.emplace(remote_endpoint, std::unique_ptr<ClientIO>(new ClientIO())).first;
                         }
-                        it->second->recv_buffer.insert(it->second->recv_buffer.end(), udp_payload_buffer.begin(), udp_payload_buffer.begin() + bytes_recvd);
+                        // append 新收到的数据
+                        it->second->recv_buffer.insert(
+                            it->second->recv_buffer.end(),
+                            udp_payload_buffer.begin(),
+                            udp_payload_buffer.begin() + bytes_recvd);
+
+                        // 防止单个插入导致超大，立刻裁剪（双重保险）
+                        if (it->second->recv_buffer.size() > MAX_CLIENT_BUFFER_SIZE)
+                        {
+                            it->second->recv_buffer.erase(
+                                it->second->recv_buffer.begin(),
+                                it->second->recv_buffer.begin() + (it->second->recv_buffer.size() - MAX_CLIENT_BUFFER_SIZE));
+                            UXR_AGENT_LOG_WARN(
+                                UXR_DECORATE_YELLOW("Client buffer truncated after receive"),
+                                "client buffer trimmed to {} bytes",
+                                it->second->recv_buffer.size());
+                        }
                     }
                 }
                 catch (const std::exception& e)
@@ -289,3 +496,4 @@ bool CustomUdpServer::handle_error(TransportRc)
 
 } // namespace uxr
 } // namespace eprosima
+

@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <type_traits>
 
 namespace eprosima {
 namespace uxr {
@@ -226,7 +227,7 @@ public:
         }
         else
         {
-            members_.at(name).data.reset(new T(std::move(value)));
+            members_.at(name).data.reset(new typename std::remove_reference<T>::type(std::move(value)));
         }
     }
 
