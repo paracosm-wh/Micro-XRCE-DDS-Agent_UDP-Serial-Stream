@@ -16,7 +16,11 @@
 namespace eprosima {
 namespace uxr {
 
-// Internal pending frames queue (kept for compatibility with Server architecture)
+// --- 配置常量 --------------------------------
+static constexpr size_t MAX_CLIENT_BUFFER_SIZE = 16 * 1024; 
+// ---------------------------------------------------------
+
+// 内部 pending 队列
 namespace {
 struct PendingFrame
 {
@@ -53,10 +57,12 @@ bool CustomUdpServer::init()
     {
         asio::ip::udp::endpoint endpoint(asio::ip::udp::v4(), port_);
         socket_.open(endpoint.protocol());
-        // Increase buffer sizes to handle high throughput or large topics
+        // 增大内核缓冲区
         socket_.set_option(asio::socket_base::receive_buffer_size(SERVER_BUFFER_SIZE * 10));
         socket_.set_option(asio::socket_base::send_buffer_size(SERVER_BUFFER_SIZE * 10));
         socket_.bind(endpoint);
+        
+        // [修复] 添加 "{}" 以适配变参宏
         UXR_AGENT_LOG_INFO(
             UXR_DECORATE_GREEN("CustomUDP server started (Raw Mode)"),
             "port: {}",
@@ -80,6 +86,7 @@ bool CustomUdpServer::fini()
     {
         socket_.close();
     }
+    // [修复] 添加 "{}" 以适配变参宏
     UXR_AGENT_LOG_INFO(
         UXR_DECORATE_GREEN("CustomUDP server stopped"),
         "port: {}",
@@ -87,47 +94,37 @@ bool CustomUdpServer::fini()
     return true;
 }
 
-/**
- * process_client_buffer (Raw Mode)
- * Directly takes the UDP payload and passes it to the Agent as a message.
- * No HDLC deframing is performed.
- */
 bool CustomUdpServer::process_client_buffer(
     ClientIO& client_io,
     const asio::ip::udp::endpoint& endpoint,
     InputPacket<CustomEndPoint>& input_packet,
     TransportRc& /*transport_rc*/)
 {
-    // If buffer is empty, nothing to do
     if (client_io.recv_buffer.empty())
     {
         return false;
     }
 
-    // 1. Create InputMessage directly from the received buffer
-    // We assume the UDP packet contains exactly one valid XRCE-DDS message (or fragment).
+    // 1. 直接构造 InputMessage (透传)
     input_packet.message.reset(new InputMessage(client_io.recv_buffer.data(), client_io.recv_buffer.size()));
 
-    // 2. Set up the source endpoint identity
+    // 2. 设置源端点信息
     CustomEndPoint custom_endpoint;
     custom_endpoint.add_member<std::string>("address");
     custom_endpoint.add_member<uint16_t>("port");
-    custom_endpoint.add_member<uint8_t>("framing_addr"); // Kept for compatibility
+    custom_endpoint.add_member<uint8_t>("framing_addr");
 
     custom_endpoint.set_member_value("address", endpoint.address().to_string());
     custom_endpoint.set_member_value("port", (uint16_t)endpoint.port());
-    // In raw UDP, we don't have a framing address inside the packet.
-    // We can default it to 0 or derive it from the IP if needed.
-    // Here we use 0x00 as a default "Stream ID".
+    // Raw UDP 模式默认 Framing Addr 为 0x00 (或 0x01，需与 Client 保持一致)
     custom_endpoint.set_member_value("framing_addr", (uint8_t)0x00);
 
     input_packet.source = custom_endpoint;
 
-    // 3. Logging
+    // 3. 日志
     uint32_t client_key = 0;
     get_client_key(input_packet.source, client_key);
     
-    // Optional: Only log if we successfully identified a client, to reduce noise
     if(client_key != 0) {
         UXR_AGENT_LOG_MESSAGE(
             UXR_DECORATE_YELLOW("[==>> CustomUDP (Raw) <<==]"),
@@ -136,7 +133,7 @@ bool CustomUdpServer::process_client_buffer(
             input_packet.message->get_len());
     }
 
-    // 4. Clear the buffer immediately since we consumed all of it
+    // 4. 清空 buffer
     client_io.recv_buffer.clear();
     client_io.read_pos = 0;
 
@@ -148,7 +145,7 @@ bool CustomUdpServer::recv_message(
         int /*timeout*/,
         TransportRc& transport_rc)
 {
-    // Check pending frames queue first (unlikely used in Raw mode but good practice)
+    // Check pending frames
     {
         std::lock_guard<std::mutex> lock(pending_frames_mutex_);
         if (!pending_frames_.empty())
@@ -174,7 +171,7 @@ bool CustomUdpServer::recv_message(
 
     while (true)
     {
-        // Process existing data in buffers
+        // Process existing data
         {
             std::lock_guard<std::mutex> lock(clients_mutex_);
             for (auto& it : client_io_map_)
@@ -189,13 +186,14 @@ bool CustomUdpServer::recv_message(
 
         // Poll socket
         pollfd pfd{socket_.native_handle(), POLLIN, 0};
-        int poll_rv = poll(&pfd, 1, 1000); // 1000ms timeout
+        int poll_rv = poll(&pfd, 1, 1000); 
 
         if (poll_rv > 0)
         {
             if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
             {
-                UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("UDP Socket Error"), "poll() error events");
+                // [修复 1] 添加 "{}" 作为格式化参数，修复编译错误
+                UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("UDP Socket Error"), "{}", "poll() error events");
                 transport_rc = TransportRc::server_error;
                 return false;
             }
@@ -204,7 +202,6 @@ bool CustomUdpServer::recv_message(
             {
                 try
                 {
-                    // Use a vector to receive data to handle variable sizes up to max MTU
                     std::vector<uint8_t> buffer(SERVER_BUFFER_SIZE); 
                     asio::ip::udp::endpoint remote_endpoint;
                     asio::error_code ec;
@@ -213,7 +210,7 @@ bool CustomUdpServer::recv_message(
 
                     if (!ec && bytes_recvd > 0)
                     {
-                        buffer.resize(bytes_recvd); // Shrink to fit
+                        buffer.resize(bytes_recvd);
 
                         std::lock_guard<std::mutex> lock(clients_mutex_);
                         auto it = client_io_map_.find(remote_endpoint);
@@ -222,9 +219,6 @@ bool CustomUdpServer::recv_message(
                             it = client_io_map_.emplace(remote_endpoint, std::unique_ptr<ClientIO>(new ClientIO())).first;
                         }
                         
-                        // In Raw mode, we assume packet boundaries matter. 
-                        // Overwrite buffer with new packet (assuming previous was processed or dropped)
-                        // If you need to support fragmentation/streams, use insert() instead.
                         it->second->recv_buffer = std::move(buffer);
                     }
                 }
@@ -254,13 +248,16 @@ bool CustomUdpServer::send_message(
             asio::ip::address::from_string(output_packet.destination.get_member<std::string>("address")),
             output_packet.destination.get_member<uint16_t>("port"));
 
-        // Raw send: directly send the message buffer without adding framing
+        // Raw send
         asio::error_code ec;
+        
+        // [修复 2] 定义变量，并立即忽略它以消除 "unused variable" 警告
         size_t sent = socket_.send_to(
             asio::buffer(output_packet.message->get_buf(), output_packet.message->get_len()), 
             destination_endpoint, 
             0, 
             ec);
+        (void)sent; // 消除警告
 
         if (ec)
         {
