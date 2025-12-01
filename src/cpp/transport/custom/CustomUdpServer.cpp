@@ -344,11 +344,27 @@ bool CustomUdpServer::send_message(
     transport_rc = TransportRc::ok;
     try
     {
+        // 1. 获取目标 IP 和 Port
+        std::string dest_ip = output_packet.destination.get_member<std::string>("address");
+        uint16_t dest_port = output_packet.destination.get_member<uint16_t>("port");
+        
         asio::ip::udp::endpoint destination_endpoint(
-            asio::ip::address::from_string(output_packet.destination.get_member<std::string>("address")),
-            output_packet.destination.get_member<uint16_t>("port"));
+            asio::ip::address::from_string(dest_ip),
+            dest_port);
 
+        // 2. 获取 Framing Address (关键调试点：转为 int 打印，防止看不见)
+        uint8_t remote_framing_addr = output_packet.destination.get_member<uint8_t>("framing_addr");
+
+        UXR_AGENT_LOG_DEBUG(
+            UXR_DECORATE_WHITE("Prepare Send"),
+            "Dest: {}:{}, FramingAddr: 0x{:02X}, PayloadLen: {}",
+            dest_ip, dest_port, (int)remote_framing_addr, output_packet.message->get_len());
+
+        // 3. 准备封帧
         std::vector<uint8_t> framed_buffer;
+        // 预分配空间，防止多次拷贝
+        framed_buffer.reserve(output_packet.message->get_len() + 20); 
+
         auto write_lam = [&](const uint8_t* buf, size_t len, TransportRc& rc) -> ssize_t
         {
             framed_buffer.insert(framed_buffer.end(), buf, buf + len);
@@ -357,31 +373,54 @@ bool CustomUdpServer::send_message(
         };
 
         FramingIO framing_io(0x00, write_lam, [](uint8_t*, size_t, int, TransportRc&){ return 0; });
-        uint8_t remote_framing_addr = output_packet.destination.get_member<uint8_t>("framing_addr");
 
+        // 执行封帧
         ssize_t bytes_written = framing_io.write_framed_msg(
             output_packet.message->get_buf(),
             output_packet.message->get_len(),
             remote_framing_addr,
             transport_rc);
 
+        // 4. 发送逻辑
         if (bytes_written > 0)
         {
             asio::error_code ec;
-            socket_.send_to(asio::buffer(framed_buffer), destination_endpoint, 0, ec);
-            if (ec) {
-                 UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("send_message error"), "ec: {}", ec.message());
-                 transport_rc = TransportRc::server_error;
-                 return false;
+            size_t sent = socket_.send_to(asio::buffer(framed_buffer), destination_endpoint, 0, ec);
+
+            if (ec)
+            {
+                UXR_AGENT_LOG_ERROR(
+                    UXR_DECORATE_RED("Socket Send Error"),
+                    "Dest: {}:{}, Error: {}",
+                    dest_ip, dest_port, ec.message());
+                transport_rc = TransportRc::server_error;
+                return false;
             }
+            
+            // 成功发送日志
+            UXR_AGENT_LOG_INFO(
+                UXR_DECORATE_YELLOW("[** >> CustomUDP (sent) >> **]"),
+                "Sent {} bytes (Payload: {}) to {}:{} (Addr: 0x{:02X})",
+                sent, output_packet.message->get_len(), dest_ip, dest_port, (int)remote_framing_addr);
+                
             return true;
+        }
+        else 
+        {
+            UXR_AGENT_LOG_ERROR(
+                UXR_DECORATE_RED("Framing Error"),
+                "Failed to frame message. Len: {}", 
+                output_packet.message->get_len());
         }
     }
     catch(const std::exception& e)
     {
-        UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("send_message exception"), "what: {}", e.what());
+        UXR_AGENT_LOG_ERROR(
+            UXR_DECORATE_RED("send_message Exception"),
+            "what: {}", e.what());
         transport_rc = TransportRc::server_error;
     }
+
     return false;
 }
 
