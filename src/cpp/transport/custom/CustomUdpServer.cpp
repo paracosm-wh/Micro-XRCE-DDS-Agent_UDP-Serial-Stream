@@ -129,21 +129,10 @@ bool CustomUdpServer::process_client_buffer(
     size_t recv_len = client_io.recv_buffer.size();
     uint8_t* buf = client_io.recv_buffer.data();
 
-    // 2. 详细日志：打印收到的原始数据头 (调试关键！)
-    // 这能让你立刻看到 7E 后面是什么，以及长度位是多少
-    /*
-    UXR_AGENT_LOG_DEBUG(
-        UXR_DECORATE_WHITE("UDP Raw Recv"),
-        "Len: {}, Data: {}", 
-        recv_len, 
-        hex_debug_str(buf, recv_len)
-    );
-    */
-
     // 3. 协议检查
     bool valid_frame = false;
     uint16_t payload_len = 0;
-    uint8_t radd = 0; // 这将作为 Framing Address
+    uint8_t client_addr = 0; // 这将存储 Client 的 ID (SADD)
 
     do {
         // [Check 1] 长度是否足够最小帧？
@@ -159,36 +148,36 @@ bool CustomUdpServer::process_client_buffer(
         }
 
         // 协议结构: [0:7E] [1:SADD] [2:RADD] [3:LEN_L] [4:LEN_H] ...
-        // 提取关键字段
-        radd = buf[2]; // Index 2 是 RADD
+        // === 关键修改 ===
+        // 获取发送者的地址 (SADD)，以便我们回复给它
+        client_addr = buf[1]; 
+        
+        // buf[2] 是 RADD (应该是指向 Agent 的，比如 0x00)，我们这里不需要处理它，或者可以校验它是否为 0x00
+
+        // 提取长度
         payload_len = (uint16_t)buf[3] | ((uint16_t)buf[4] << 8);
 
         // [Check 3] 长度是否匹配?
-        // UDP 包长度 必须等于 协议声明的长度
         size_t expected_total_len = payload_len + OVERHEAD_SIZE;
         if (recv_len != expected_total_len) {
             UXR_AGENT_LOG_WARN(
                 UXR_DECORATE_RED("Parse Fail"), 
                 "Length Mismatch! UDP says: {}, Protocol says: {} (Payload: {})", 
                 recv_len, expected_total_len, payload_len);
-            // 打印 Hex 帮助排查是不是字节错位了
             UXR_AGENT_LOG_WARN(UXR_DECORATE_RED("Debug Dump"), "{}", hex_debug_str(buf, recv_len));
             break;
         }
 
-        // 一切正常
         valid_frame = true;
 
     } while(0);
 
     if (!valid_frame) {
-        // 解析失败，清空缓冲区丢弃坏数据
         client_io.recv_buffer.clear();
         return false;
     }
 
-    // 4. 提取 Payload 并在 Agent 内部传递
-    // Payload 从 Index 5 开始 (7E + SADD + RADD + LEN + LEN)
+    // 4. 提取 Payload
     input_packet.message.reset(new InputMessage(&buf[HEADER_SIZE], payload_len));
 
     CustomEndPoint custom_endpoint;
@@ -198,12 +187,15 @@ bool CustomUdpServer::process_client_buffer(
     
     custom_endpoint.set_member_value("address", endpoint.address().to_string());
     custom_endpoint.set_member_value("port", (uint16_t)endpoint.port());
-    // 将 RADD 映射为 Agent 识别的 Session ID (framing_addr)
-    custom_endpoint.set_member_value("framing_addr", radd); 
+    
+    // === 这里设置回信地址 ===
+    // 将提取到的 client_addr (原 SADD) 存入 framing_addr
+    // 之后 send_message 会将其作为 RADD 发回给 Client
+    custom_endpoint.set_member_value("framing_addr", client_addr); 
     
     input_packet.source = custom_endpoint;
 
-    // 清空 buffer，表示已消费
+    // 清空 buffer
     client_io.recv_buffer.clear();
 
     // 5. 成功日志
@@ -211,14 +203,13 @@ bool CustomUdpServer::process_client_buffer(
     if(get_client_key(input_packet.source, client_key)) {
         UXR_AGENT_LOG_INFO(
             UXR_DECORATE_GREEN("Packet OK"), 
-            "Key: 0x{:08X}, Payload: {}, RADD: 0x{:02X}", 
-            client_key, payload_len, radd);
+            "Key: 0x{:08X}, Payload: {}, ClientID: 0x{:02X}", 
+            client_key, payload_len, client_addr);
     } else {
-        // 这是建立 Session 前的正常日志
         UXR_AGENT_LOG_INFO(
             UXR_DECORATE_YELLOW("New Session?"), 
-            "Payload: {}, RADD: 0x{:02X} (No Key yet)", 
-            payload_len, radd);
+            "Payload: {}, ClientID: 0x{:02X} (No Key yet)", 
+            payload_len, client_addr);
     }
 
     return true;
