@@ -5,12 +5,9 @@
 #include <uxr/agent/transport/endpoint/CustomEndPoint.hpp>
 #include <uxr/agent/transport/stream_framing/StreamFramingProtocol.hpp>
 
-#include <asio.hpp>
-#include <map>
-#include <mutex>
 #include <vector>
-#include <chrono>
-#include <memory>
+#include <sys/poll.h>
+#include <netinet/in.h>
 
 namespace eprosima {
 namespace uxr {
@@ -24,24 +21,10 @@ public:
 
     ~CustomUdpServer() override;
 
-    /**
-     * @brief This function is not supported in this custom transport.
-     */
     bool has_discovery() final { return false; }
-
-    /**
-     * @brief This function is not supported in this custom transport.
-     */
     bool has_p2p() final { return false; }
 
 private:
-    struct ClientIO
-    {
-        // recv buffering
-        std::vector<uint8_t> recv_buffer;
-        size_t read_pos = 0;
-    };
-
     bool init() override;
     bool fini() override;
 
@@ -57,19 +40,28 @@ private:
     bool handle_error(
         TransportRc transport_rc) override;
 
+    ssize_t write_data(
+        uint8_t* buf,
+        size_t len,
+        TransportRc& transport_rc);
 
-    bool process_client_buffer(
-        ClientIO& client_io,
-        const asio::ip::udp::endpoint& endpoint,
-        InputPacket<CustomEndPoint>& input_packet,
+    ssize_t read_data(
+        uint8_t* buf,
+        size_t len,
+        int timeout,
         TransportRc& transport_rc);
 
 private:
     uint16_t port_;
-    asio::io_service io_service_;
-    asio::ip::udp::socket socket_;
-    std::map<asio::ip::udp::endpoint, std::unique_ptr<ClientIO>> client_io_map_;
-    std::mutex clients_mutex_;
+    struct pollfd poll_fd_;
+    uint8_t buffer_[SERVER_BUFFER_SIZE];
+    FramingIO framing_io_;
+    
+    // UDP buffering and addressing
+    std::vector<uint8_t> input_buffer_;
+    size_t input_buffer_pos_;
+    struct sockaddr_in source_to_map_; // Last received address from UDP
+    struct sockaddr_in dest_to_send_;  // Destination for the current send operation
 };
 
 } // namespace uxr

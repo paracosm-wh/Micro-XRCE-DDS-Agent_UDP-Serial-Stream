@@ -2,323 +2,304 @@
 #include <uxr/agent/utils/Conversion.hpp>
 #include <uxr/agent/logger/Logger.hpp>
 
-#include <asio.hpp>
-#include <poll.h>
 #include <unistd.h>
-#include <algorithm>
-#include <vector>
-#include <array>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <cstring>
-#include <deque>
-#include <mutex>
-#include <string>
+#include <cerrno>
 
 namespace eprosima {
 namespace uxr {
 
-// --- 配置常量 --------------------------------
-static constexpr size_t MAX_CLIENT_BUFFER_SIZE = 16 * 1024; 
-// ---------------------------------------------------------
-
-// 内部 pending 队列 (用于存储未处理的消息)
-namespace {
-struct PendingFrame
-{
-    std::unique_ptr<InputMessage> msg;
-    std::string address;
-    uint16_t port;
-    uint8_t framing_addr;
-};
-static std::deque<PendingFrame> pending_frames_;
-static std::mutex pending_frames_mutex_;
-} // anonymous
-
 CustomUdpServer::CustomUdpServer(
         uint16_t port,
         Middleware::Kind middleware_kind)
-    : Server<CustomEndPoint>(middleware_kind)
-    , port_(port)
-    , socket_(io_service_)
+    : Server<CustomEndPoint>{middleware_kind}
+    , port_{port}
+    , poll_fd_{-1, 0, 0}
+    , buffer_{0}
+    , framing_io_(
+          0x00, // Default Agent Address
+          std::bind(&CustomUdpServer::write_data, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3),
+          std::bind(&CustomUdpServer::read_data, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4))
+    , input_buffer_pos_(0)
 {
 }
 
 CustomUdpServer::~CustomUdpServer()
 {
-    if (socket_.is_open())
+    try
     {
-        fini();
+        stop();
+    }
+    catch (std::exception& e)
+    {
+        UXR_AGENT_LOG_CRITICAL(
+            UXR_DECORATE_RED("error stopping server"),
+            "exception: {}",
+            e.what());
     }
 }
 
 bool CustomUdpServer::init()
 {
     bool rv = false;
-    try
+
+    poll_fd_.fd = socket(PF_INET, SOCK_DGRAM, 0);
+
+    if (-1 != poll_fd_.fd)
     {
-        asio::ip::udp::endpoint endpoint(asio::ip::udp::v4(), port_);
-        socket_.open(endpoint.protocol());
-        // 增大内核缓冲区，防止高吞吐时丢包
-        socket_.set_option(asio::socket_base::receive_buffer_size(SERVER_BUFFER_SIZE * 10));
-        socket_.set_option(asio::socket_base::send_buffer_size(SERVER_BUFFER_SIZE * 10));
-        socket_.bind(endpoint);
-        
-        // [修复编译错误] 增加格式化参数 "{}"
-        UXR_AGENT_LOG_INFO(
-            UXR_DECORATE_GREEN("CustomUDP server started (Raw Pass-through)"),
-            "port: {}",
-            port_);
-        rv = true;
+        struct sockaddr_in address{};
+
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port_);
+        address.sin_addr.s_addr = INADDR_ANY;
+        memset(address.sin_zero, '\0', sizeof(address.sin_zero));
+
+        if (-1 != bind(poll_fd_.fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)))
+        {
+            poll_fd_.events = POLLIN;
+            rv = true;
+
+            UXR_AGENT_LOG_DEBUG(
+                UXR_DECORATE_GREEN("Custom UDP port opened"),
+                "port: {}",
+                port_);
+
+            UXR_AGENT_LOG_INFO(
+                UXR_DECORATE_GREEN("running..."),
+                "port: {}",
+                port_);
+        }
+        else
+        {
+            UXR_AGENT_LOG_ERROR(
+                UXR_DECORATE_RED("bind error"),
+                "port: {}, errno: {}",
+                port_, errno);
+        }
     }
-    catch (const std::exception& e)
+    else
     {
         UXR_AGENT_LOG_ERROR(
-            UXR_DECORATE_RED("CustomUDP server error"),
-            "port: {}, what: {}",
-            port_,
-            e.what());
+            UXR_DECORATE_RED("socket error"),
+            "port: {}, errno: {}",
+            port_, errno);
     }
+
     return rv;
 }
 
 bool CustomUdpServer::fini()
 {
-    if (socket_.is_open())
+    if (-1 == poll_fd_.fd)
     {
-        socket_.close();
-    }
-    // [修复编译错误] 增加格式化参数 "{}"
-    UXR_AGENT_LOG_INFO(
-        UXR_DECORATE_GREEN("CustomUDP server stopped"),
-        "port: {}",
-        port_);
-    return true;
-}
-
-/**
- * 核心接收函数 (纯透传)
- * 逻辑：直接将 client_io.recv_buffer 的内容视为一条完整的 DDS 消息
- */
-bool CustomUdpServer::process_client_buffer(
-    ClientIO& client_io,
-    const asio::ip::udp::endpoint& endpoint,
-    InputPacket<CustomEndPoint>& input_packet,
-    TransportRc& /*transport_rc*/)
-{
-    // 如果没有数据，直接返回
-    if (client_io.recv_buffer.empty())
-    {
-        return false;
+        return true;
     }
 
-    // 1. 获取数据指针和长度
-    size_t len = client_io.recv_buffer.size();
-    uint8_t* buf = client_io.recv_buffer.data();
-
-    // 2. 直接构建消息 (不解析 7E, 不解析长度，不校验 CRC)
-    input_packet.message.reset(new InputMessage(buf, len));
-
-    // 3. 构建源端点信息
-    CustomEndPoint custom_endpoint;
-    custom_endpoint.add_member<std::string>("address");
-    custom_endpoint.add_member<uint16_t>("port");
-    custom_endpoint.add_member<uint8_t>("framing_addr"); // 保留字段
-
-    custom_endpoint.set_member_value("address", endpoint.address().to_string());
-    custom_endpoint.set_member_value("port", (uint16_t)endpoint.port());
-    
-    // 在纯透传模式下，没有协议头来告诉我们 Session ID (framing_addr)。
-    // 我们必须指定一个默认值（例如 0x00），或者依靠 ClientKey (Agent 会自动处理)。
-    // 注意：如果 ESP32 端期望收到的回复包里 RADD 是特定值（如 0x01），你需要在这里硬编码。
-    uint8_t dummy_framing_addr = 0x00; 
-    custom_endpoint.set_member_value("framing_addr", dummy_framing_addr);
-
-    input_packet.source = custom_endpoint;
-
-    // 4. 打印调试日志
-    uint32_t client_key = 0;
-    get_client_key(input_packet.source, client_key);
-    
-    if (client_key != 0) {
-        UXR_AGENT_LOG_MESSAGE(
-            UXR_DECORATE_YELLOW("[==>> RAW UDP RECV <<==]"),
-            client_key,
-            input_packet.message->get_buf(),
-            input_packet.message->get_len());
-    } else {
-        // 尚未建立 Session 时的日志
+    bool rv = false;
+    if (0 == ::close(poll_fd_.fd))
+    {
+        poll_fd_.fd = -1;
+        rv = true;
         UXR_AGENT_LOG_INFO(
-            UXR_DECORATE_WHITE("Raw UDP Recv (Unknown Session)"),
-            "Len: {}, IP: {}",
-            len, endpoint.address().to_string());
+            UXR_DECORATE_GREEN("server stopped"),
+            "port: {}",
+            port_);
     }
-
-    // 5. 消费完毕，清空缓冲区
-    client_io.recv_buffer.clear();
-    client_io.read_pos = 0;
-
-    return true;
+    else
+    {
+        UXR_AGENT_LOG_ERROR(
+            UXR_DECORATE_RED("socket error"),
+            "port: {}, errno: {}",
+            port_, errno);
+    }
+    return rv;
 }
 
 bool CustomUdpServer::recv_message(
         InputPacket<CustomEndPoint>& input_packet,
-        int /*timeout*/,
+        int timeout,
         TransportRc& transport_rc)
 {
-    // 优先处理 Pending 队列
+    bool rv = false;
+    uint8_t remote_addr = 0x00;
+    ssize_t bytes_read = 0;
+
+    // This call drives read_data, which fetches UDP packets
+    do
     {
-        std::lock_guard<std::mutex> lock(pending_frames_mutex_);
-        if (!pending_frames_.empty())
+        bytes_read = framing_io_.read_framed_msg(
+            buffer_, SERVER_BUFFER_SIZE, remote_addr, timeout, transport_rc);
+    }
+    while ((0 == bytes_read) && (0 < timeout));
+
+    if (0 < bytes_read)
+    {
+        input_packet.message.reset(new InputMessage(buffer_, static_cast<size_t>(bytes_read)));
+        
+        // Construct CustomEndPoint
+        // We use the address from the UDP packet (source_to_map_) 
+        // AND the framing address from the message (remote_addr)
+        CustomEndPoint custom_endpoint;
+        custom_endpoint.add_member<std::string>("address");
+        custom_endpoint.add_member<uint16_t>("port");
+        custom_endpoint.add_member<uint8_t>("framing_addr");
+
+        custom_endpoint.set_member_value("address", std::string(inet_ntoa(source_to_map_.sin_addr)));
+        // Cast to uint16_t explicitly to ensure correct storage type in CustomEndPoint
+        custom_endpoint.set_member_value("port", static_cast<uint16_t>(ntohs(source_to_map_.sin_port)));
+        custom_endpoint.set_member_value("framing_addr", remote_addr);
+
+        input_packet.source = custom_endpoint;
+        rv = true;
+
+        uint32_t raw_client_key;
+        if (get_client_key(input_packet.source, raw_client_key))
         {
-            PendingFrame pf = std::move(pending_frames_.front());
-            pending_frames_.pop_front();
-
-            input_packet.message.reset(new InputMessage(pf.msg->get_buf(), pf.msg->get_len()));
-
-            CustomEndPoint custom_endpoint;
-            custom_endpoint.add_member<std::string>("address");
-            custom_endpoint.add_member<uint16_t>("port");
-            custom_endpoint.add_member<uint8_t>("framing_addr");
-            custom_endpoint.set_member_value("address", pf.address);
-            custom_endpoint.set_member_value("port", pf.port);
-            custom_endpoint.set_member_value("framing_addr", pf.framing_addr);
-            input_packet.source = custom_endpoint;
-
-            transport_rc = TransportRc::ok;
-            return true;
+            UXR_AGENT_LOG_MESSAGE(
+                UXR_DECORATE_YELLOW("[==>> C-UDP <<==]"),
+                raw_client_key,
+                input_packet.message->get_buf(),
+                input_packet.message->get_len());
         }
     }
-
-    while (true)
-    {
-        // 处理现有缓冲区数据
-        {
-            std::lock_guard<std::mutex> lock(clients_mutex_);
-            for (auto& it : client_io_map_)
-            {
-                if (it.second->recv_buffer.empty()) continue;
-                if (process_client_buffer(*it.second, it.first, input_packet, transport_rc))
-                {
-                    return true;
-                }
-            }
-        }
-
-        // 轮询 Socket
-        pollfd pfd{socket_.native_handle(), POLLIN, 0};
-        int poll_rv = poll(&pfd, 1, 1000); 
-
-        if (poll_rv > 0)
-        {
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-            {
-                // [修复编译错误] 增加格式化参数 "{}"
-                UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("UDP Socket Error"), "{}", "poll() error events");
-                transport_rc = TransportRc::server_error;
-                return false;
-            }
-
-            if (pfd.revents & POLLIN)
-            {
-                try
-                {
-                    // 接收 UDP 数据
-                    std::vector<uint8_t> buffer(SERVER_BUFFER_SIZE); 
-                    asio::ip::udp::endpoint remote_endpoint;
-                    asio::error_code ec;
-                    
-                    size_t bytes_recvd = socket_.receive_from(asio::buffer(buffer), remote_endpoint, 0, ec);
-
-                    if (!ec && bytes_recvd > 0)
-                    {
-                        buffer.resize(bytes_recvd);
-
-                        std::lock_guard<std::mutex> lock(clients_mutex_);
-                        auto it = client_io_map_.find(remote_endpoint);
-                        if (it == client_io_map_.end())
-                        {
-                            it = client_io_map_.emplace(remote_endpoint, std::unique_ptr<ClientIO>(new ClientIO())).first;
-                        }
-                        
-                        // 在透传模式下，直接覆盖旧数据（假设 UDP 不粘包）
-                        // 这样保证处理的是最新的完整包
-                        it->second->recv_buffer = std::move(buffer);
-                    }
-                }
-                catch (const std::exception& e)
-                {
-                    UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("recv_message exception"), "what: {}", e.what());
-                }
-            }
-        }
-        else if (poll_rv < 0)
-        {
-            transport_rc = TransportRc::server_error;
-            return false;
-        }
-    }
-    return false;
+    return rv;
 }
 
-/**
- * 发送函数 (纯透传)
- * 逻辑：直接发送 Payload，不加 7E 头，不加 CRC
- */
 bool CustomUdpServer::send_message(
         OutputPacket<CustomEndPoint> output_packet,
         TransportRc& transport_rc)
 {
-    transport_rc = TransportRc::ok;
-    try
+    bool rv = false;
+
+    // Prepare destination for write_data
+    memset(&dest_to_send_, 0, sizeof(dest_to_send_));
+    dest_to_send_.sin_family = AF_INET;
+    dest_to_send_.sin_port = htons(output_packet.destination.get_member<uint16_t>("port"));
+    std::string ip_str = output_packet.destination.get_member<std::string>("address");
+    inet_aton(ip_str.c_str(), &dest_to_send_.sin_addr);
+
+    uint8_t dest_framing_addr = output_packet.destination.get_member<uint8_t>("framing_addr");
+
+    ssize_t bytes_written =
+            framing_io_.write_framed_msg(
+                output_packet.message->get_buf(),
+                output_packet.message->get_len(),
+                dest_framing_addr,
+                transport_rc);
+
+    if ((0 < bytes_written) && (
+         static_cast<size_t>(bytes_written) == output_packet.message->get_len()))
     {
-        asio::ip::udp::endpoint destination_endpoint(
-            asio::ip::address::from_string(output_packet.destination.get_member<std::string>("address")),
-            output_packet.destination.get_member<uint16_t>("port"));
+        rv = true;
 
-        // Raw Send: 直接发 buffer
-        asio::error_code ec;
-        size_t sent = socket_.send_to(
-            asio::buffer(output_packet.message->get_buf(), output_packet.message->get_len()), 
-            destination_endpoint, 
-            0, 
-            ec);
-        
-        // [修复未使用变量警告] 显式忽略 sent
-        (void)sent;
-
-        if (ec)
+        uint32_t raw_client_key;
+        if (get_client_key(output_packet.destination, raw_client_key))
         {
-            UXR_AGENT_LOG_ERROR(
-                UXR_DECORATE_RED("send_message error"),
-                "endpoint: {}:{}, what: {}",
-                destination_endpoint.address().to_string(),
-                destination_endpoint.port(),
-                ec.message());
-            transport_rc = TransportRc::server_error;
-            return false;
+            UXR_AGENT_LOG_MESSAGE(
+                UXR_DECORATE_YELLOW("[** <<C-UDP>> **]"),
+                raw_client_key,
+                output_packet.message->get_buf(),
+                output_packet.message->get_len());
         }
-
-        uint32_t client_key = 0;
-        get_client_key(output_packet.destination, client_key);
-        UXR_AGENT_LOG_MESSAGE(
-            UXR_DECORATE_YELLOW("[** >> RAW UDP SENT >> **]"),
-            client_key,
-            output_packet.message->get_buf(),
-            output_packet.message->get_len());
-            
-        return true;
     }
-    catch(const std::exception& e)
-    {
-        UXR_AGENT_LOG_ERROR(UXR_DECORATE_RED("send_message exception"), "what: {}", e.what());
-        transport_rc = TransportRc::server_error;
-    }
-
-    return false;
+    return rv;
 }
 
-bool CustomUdpServer::handle_error(TransportRc)
+bool CustomUdpServer::handle_error(
+        TransportRc /*transport_rc*/)
 {
-    return true;
+    return fini() && init();
+}
+
+ssize_t CustomUdpServer::write_data(
+        uint8_t* buf,
+        size_t len,
+        TransportRc& transport_rc)
+{
+    size_t rv = 0;
+    ssize_t bytes_written = sendto(
+        poll_fd_.fd,
+        buf,
+        len,
+        0,
+        reinterpret_cast<struct sockaddr*>(&dest_to_send_),
+        sizeof(dest_to_send_));
+
+    if (0 < bytes_written)
+    {
+        rv = size_t(bytes_written);
+    }
+    else
+    {
+        transport_rc = TransportRc::server_error;
+    }
+    return rv;
+}
+
+ssize_t CustomUdpServer::read_data(
+        uint8_t* buf,
+        size_t len,
+        int timeout,
+        TransportRc& transport_rc)
+{
+    // 1. Serve from internal buffer if available
+    if (input_buffer_pos_ < input_buffer_.size())
+    {
+        size_t available = input_buffer_.size() - input_buffer_pos_;
+        size_t to_copy = (available < len) ? available : len;
+        memcpy(buf, input_buffer_.data() + input_buffer_pos_, to_copy);
+        input_buffer_pos_ += to_copy;
+        return to_copy;
+    }
+
+    // 2. If empty, fetch new packet
+    input_buffer_.clear();
+    input_buffer_pos_ = 0;
+
+    int poll_rv = poll(&poll_fd_, 1, timeout);
+    if(poll_fd_.revents & (POLLERR+POLLHUP))
+    {
+        transport_rc = TransportRc::server_error;
+    }
+    else if (0 < poll_rv)
+    {
+        // We have a packet waiting
+        uint8_t temp_buf[SERVER_BUFFER_SIZE];
+        struct sockaddr_in client_addr{};
+        socklen_t addr_len = sizeof(client_addr);
+
+        ssize_t bytes_recvd = recvfrom(
+            poll_fd_.fd,
+            temp_buf,
+            sizeof(temp_buf),
+            0,
+            reinterpret_cast<struct sockaddr*>(&client_addr),
+            &addr_len);
+
+        if (bytes_recvd > 0)
+        {
+            input_buffer_.assign(temp_buf, temp_buf + bytes_recvd);
+            source_to_map_ = client_addr; // Capture source of this stream chunk
+            
+            size_t to_copy = (size_t(bytes_recvd) < len) ? size_t(bytes_recvd) : len;
+            memcpy(buf, input_buffer_.data(), to_copy);
+            input_buffer_pos_ = to_copy;
+            return to_copy;
+        }
+        else if (0 > bytes_recvd)
+        {
+            transport_rc = TransportRc::server_error;
+        }
+    }
+    else
+    {
+        transport_rc = (poll_rv == 0) ? TransportRc::timeout_error : TransportRc::server_error;
+    }
+    return 0;
 }
 
 } // namespace uxr
