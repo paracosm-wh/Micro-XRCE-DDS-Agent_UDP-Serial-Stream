@@ -6,6 +6,7 @@
 #include <uxr/agent/transport/stream_framing/StreamFramingProtocol.hpp>
 
 #include <vector>
+#include <chrono>
 #include <sys/poll.h>
 #include <netinet/in.h>
 
@@ -25,6 +26,8 @@ public:
     bool has_p2p() final { return false; }
 
 private:
+    // 上次发送结束的时间点
+    std::chrono::steady_clock::time_point last_send_time_;
     bool init() override;
     bool fini() override;
 

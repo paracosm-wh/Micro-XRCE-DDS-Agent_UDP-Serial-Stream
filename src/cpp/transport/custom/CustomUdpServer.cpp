@@ -25,6 +25,7 @@ CustomUdpServer::CustomUdpServer(
           std::bind(&CustomUdpServer::write_data, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3),
           std::bind(&CustomUdpServer::read_data, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4))
     , input_buffer_pos_(0)
+    , last_send_time_(std::chrono::steady_clock::now()) // 初始化
 {
     // [优化] 预分配内存，避免 vector 频繁扩容带来的性能损耗
     input_buffer_.reserve(SERVER_BUFFER_SIZE);
@@ -151,6 +152,29 @@ bool CustomUdpServer::send_message(
         OutputPacket<CustomEndPoint> output_packet,
         TransportRc& transport_rc)
 {
+    // =================================================================
+    // [优化] 软件流控 (Traffic Shaping)
+    // 目标：解决 1.5Mbps 无流控串口的 TX Buffer 溢出问题。
+    // 策略：强制两个 UDP 包之间至少保留 1000 微秒 (1ms) 的间隔。
+    //       1ms 足够串口发送约 150 字节，足以防止积压。
+    // =================================================================
+    
+    // 1. 定义最小间隔 (微秒)
+    // 200Hz = 5000us, 500Hz = 2000us, 1000Hz = 1000us
+    // 推荐 1000us (1ms)，既稳又快，不会明显阻塞接收线程
+    const int64_t MIN_SEND_INTERVAL_US = 1000; 
+
+    // 2. 计算距离上次发送过去了多久
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last_send_time_).count();
+
+    // 3. 如果发送太快，补足剩余时间
+    if (elapsed < MIN_SEND_INTERVAL_US)
+    {
+        int64_t sleep_us = MIN_SEND_INTERVAL_US - elapsed;
+        usleep(static_cast<useconds_t>(sleep_us));
+    }
+    
     bool rv = false;
     
     // [优化] 1. 准备目标 UDP 地址结构体
@@ -218,7 +242,7 @@ bool CustomUdpServer::send_message(
     {
         // Framing 生成失败，transport_rc 已经在 write_framed_msg 中被设置
     }
-
+    last_send_time_ = std::chrono::steady_clock::now();
     return rv;
 }
 
