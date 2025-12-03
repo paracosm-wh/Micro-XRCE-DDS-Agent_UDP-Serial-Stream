@@ -40,6 +40,7 @@ private:
     bool handle_error(
         TransportRc transport_rc) override;
 
+    // FramingIO 回调函数
     ssize_t write_data(
         uint8_t* buf,
         size_t len,
@@ -54,14 +55,20 @@ private:
 private:
     uint16_t port_;
     struct pollfd poll_fd_;
-    uint8_t buffer_[SERVER_BUFFER_SIZE];
+    
+    // [注释] framing_io_ 解码时使用的临时 buffer，必须足够大以容纳最大帧
+    uint8_t buffer_[SERVER_BUFFER_SIZE]; 
     FramingIO framing_io_;
     
-    // UDP buffering and addressing
+    // [注释] 接收缓冲：用于暂存从 UDP socket 读取的原始数据流
     std::vector<uint8_t> input_buffer_;
     size_t input_buffer_pos_;
-    struct sockaddr_in source_to_map_; // Last received address from UDP
-    struct sockaddr_in dest_to_send_;  // Destination for the current send operation
+    
+    // [注释] 发送缓冲：用于聚合 FramingIO 生成的 Header+Payload+CRC，确保单次 UDP 发送
+    std::vector<uint8_t> tx_buffer_;
+
+    // 地址映射辅助变量
+    struct sockaddr_in source_to_map_; // 最近一次接收到的 UDP 来源地址
 };
 
 } // namespace uxr
